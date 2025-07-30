@@ -32,10 +32,11 @@ document.getElementById('cnpjInput').addEventListener('keypress', e => {
 // ---------------------------------------------------------------------------------
 
 /**
- * The main async function that controls the entire CNPJ lookup process.
- * It initiates calls to both ReceitaWS and CNPJ.A APIs concurrently.
- * It will display data from whichever API responds first, and then update
- * the card if the primary source (ReceitaWS) arrives later.
+ * The main async function that orchestrates the CNPJ consultation process.
+ * It initiates calls to THREE APIs concurrently: ReceitaWS (primary),
+ * CNPJ.A (secondary), and MinhaReceita (secondary). It displays data from
+ * whichever API responds first, and then updates the card if the primary
+ * source (ReceitaWS) arrives later.
  */
 async function consultarCNPJ() {
     const cnpjInput = document.getElementById('cnpjInput').value;
@@ -56,77 +57,76 @@ async function consultarCNPJ() {
     loadingDiv.style.display = 'block';
     foldTopSection();
 
-    // 2. State management for handling the race condition
+    // 2. State management for the three-way race
     let cnpjaDataCache = null;
     let receitaWsDataCache = null;
+    let minhaReceitaDataCache = null;
     let hasRendered = false;
-    let cnpjaFailed = false;
-    let receitaWsFailed = false;
+    let failedApiCount = 0;
+    const TOTAL_APIS = 3;
 
     // 3. Define handler functions for API responses
 
     const handleFailure = (apiName) => {
         console.error(`${apiName} API failed or returned no data.`);
-        if (apiName === 'CNPJA') cnpjaFailed = true;
-        if (apiName === 'ReceitaWS') receitaWsFailed = true;
-
-        // If both have failed, show the final error message
-        if (cnpjaFailed && receitaWsFailed) {
+        failedApiCount++;
+        // If all APIs have failed, show the final error message
+        if (failedApiCount === TOTAL_APIS) {
             loadingDiv.style.display = 'none';
-            mostrarErro('Ambas as fontes de dados falharam. Tente novamente mais tarde.');
+            mostrarErro('Todas as fontes de dados falharam. Tente novamente mais tarde.');
         }
     };
 
-    // --- Handler for CNPJ.A (Fallback/Secondary API) ---
+    // --- Handler for CNPJ.A (Secondary) ---
     const handleCnpjaResponse = (data) => {
-        if (!data) {
-            handleFailure('CNPJA');
-            // Ensure the IE placeholder is updated to show "not found" if ReceitaWS succeeds
-            updateCardWithIEData(null, receitaWsDataCache?.uf);
-            return;
-        }
-
+        if (!data) return handleFailure('CNPJA');
         console.log("CNPJ.A data arrived.");
         cnpjaDataCache = data;
 
-        // If ReceitaWS has already rendered, just update the IE part
-        if (receitaWsDataCache) {
+        if (receitaWsDataCache) { // If primary is already rendered, just update IE
             updateCardWithIEData(cnpjaDataCache, receitaWsDataCache.uf);
-        }
-        // Otherwise, if nothing is on screen yet, render this as a fallback
-        else if (!hasRendered) {
-            loadingDiv.style.display = 'none'; // Hide main spinner on first render
+        } else if (!hasRendered) { // Otherwise, if we're first, render ourselves
+            loadingDiv.style.display = 'none';
             hasRendered = true;
             console.log("Rendering fallback data from CNPJ.A.");
             renderCardFromCNPJA(data, resultsDiv);
-            addWarningMessage("Exibindo dados preliminares. Atualizando com a fonte principal em instantes...");
+            addWarningMessage("Exibindo dados preliminares. Atualizando com a fonte principal...");
         }
     };
 
-    // --- Handler for ReceitaWS (Primary API) ---
-    const handleReceitaWsResponse = (data) => {
-        if (!data) {
-            handleFailure('ReceitaWS');
-            return;
-        }
+    // --- Handler for MinhaReceita (Secondary) ---
+    const handleMinhaReceitaResponse = (data) => {
+        if (!data) return handleFailure('MinhaReceita');
+        console.log("MinhaReceita data arrived.");
+        minhaReceitaDataCache = data;
 
-        loadingDiv.style.display = 'none'; // Hide main spinner
-        hasRendered = true;
+        if (!receitaWsDataCache && !hasRendered) { // If we are first, render
+            loadingDiv.style.display = 'none';
+            hasRendered = true;
+            console.log("Rendering fallback data from MinhaReceita.");
+            renderCardFromMinhaReceita(data, resultsDiv);
+            addWarningMessage("Exibindo dados preliminares. Atualizando com a fonte principal...");
+        }
+    };
+
+    // --- Handler for ReceitaWS (Primary Source of Truth) ---
+    const handleReceitaWsResponse = (data) => {
+        if (!data) return handleFailure('ReceitaWS');
+        loadingDiv.style.display = 'none';
+        hasRendered = true; // Mark as rendered (or re-rendered)
         console.log("ReceitaWS data arrived. Rendering primary data.");
         receitaWsDataCache = data;
 
-        // Always re-render with ReceitaWS data as it's the source of truth
+        // ALWAYS render with ReceitaWS data, as it's the source of truth
         renderCardFromReceitaWS(data, resultsDiv);
-
-        // If CNPJ.A data has already arrived, use it to fill in the IE details.
-        // If not, the IE card will continue showing its loading spinner until the other call finishes.
+        // Use cached CNPJ.A data to fill in IE if it has already arrived
         updateCardWithIEData(cnpjaDataCache, receitaWsDataCache.uf);
     };
 
-    // 4. Initiate both API calls concurrently without 'await'
-    // This starts the "race". The .then() clause will execute whenever each one finishes.
+    // 4. Initiate ALL THREE API calls concurrently to start the race
     consultarCNPJA_API(cnpjLimpo).then(handleCnpjaResponse);
     consultarReceitaWS(cnpjLimpo).then(handleReceitaWsResponse);
+    consultarMinhaReceitaAPI(cnpjLimpo).then(handleMinhaReceitaResponse);
 }
 
 
@@ -204,6 +204,37 @@ async function consultarReceitaWS(cnpj) {
     return null; // Return null to indicate final failure
 }
 
+/**
+ * Fetches company data from the minhareceita.org API.
+ * This is a secondary data source. Includes a retry mechanism.
+ * @param {string} cnpj - The clean, numbers-only CNPJ.
+ * @returns {Promise<object|null>} A promise that resolves to the JSON data or null if it fails.
+ */
+async function consultarMinhaReceitaAPI(cnpj) {
+    const MAX_RETRIES = 2; // This API can be slower, so fewer retries
+    const RETRY_DELAY_MS = 1500;
+    const cleanCNPJ = limparCNPJ(cnpj); // Ensure only numbers are used
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            // This API uses a different URL structure
+            const response = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(`https://minhareceita.org/${cleanCNPJ}`)}`);
+            if (response.ok) {
+                const result = JSON.parse((await response.json()).contents);
+                // Check for a valid response, which should have a cnpj field
+                if (result && result.cnpj) {
+                    return result; // Success
+                }
+            }
+            console.warn(`Attempt ${attempt}: MinhaReceita API request failed or returned invalid data. Retrying...`);
+        } catch (error) {
+            console.error(`Attempt ${attempt}: Error during MinhaReceita API fetch:`, error);
+        }
+        if (attempt < MAX_RETRIES) await delay(RETRY_DELAY_MS);
+    }
+    console.error(`All ${MAX_RETRIES} attempts to fetch data from MinhaReceita failed.`);
+    return null;
+}
 
 // =================================================================================
 // ==================== 4. DYNAMIC UI RENDERING & UPDATING =========================
@@ -406,6 +437,74 @@ function updateCardWithIEData(cnpjaData, mainState) {
     }
 }
 
+/**
+ * Renders the company card using data from the MinhaReceita API.
+ * This is used as a fast secondary source.
+ * @param {object} data - The data object from the consultarMinhaReceitaAPI call.
+ * @param {HTMLElement} container - The container element to inject the HTML into.
+ */
+function renderCardFromMinhaReceita(data, container) {
+    const statusMap = { 'ATIVA': { text: 'Ativa', class: 'status-active' } };
+    const statusInfo = statusMap[data.descricao_situacao_cadastral] || { text: data.descricao_situacao_cadastral, class: 'status-warning' };
+    const taxRegimeInfo = getTaxRegimeInfo(data);
+    const contatoHTML = gerarContatoHTML(data, null); // Pass the whole object
+    const sociosHTML = gerarSociosHTML(data.qsa);
+    const atividadesSecundariasHTML = gerarAtividadesSecundariasHTML(data.cnaes_secundarios);
+
+    container.innerHTML = `
+        <div class="company-card">
+            <div id="card-warning-message-container"></div>
+            <div class="company-header">
+                <div class="company-info-left">
+                    <div class="company-name">${data.nome_fantasia || data.razao_social || 'N/A'}</div>
+                    <div class="company-cnpj copyable" onclick="copyToClipboard(this)">${formatarCNPJ(data.cnpj || '')}</div>
+                </div>
+                <div class="status-container">
+                    <div class="${taxRegimeInfo.class}">${taxRegimeInfo.text}</div>
+                    <div class="status-badge ${statusInfo.class}">${statusInfo.text}</div>
+                </div>
+            </div>
+            <div class="info-grid">
+                <div class="info-card">
+                    <h3>📋 Informações Básicas</h3>
+                    <p><strong>Razão Social:</strong><br><span class="copyable" onclick="copyToClipboard(this)">${data.razao_social || 'N/A'}</span></p>
+                    <p><strong>Data de Abertura:</strong><br><span class="copyable" onclick="copyToClipboard(this)">${formatarData(data.data_inicio_atividade) || 'N/A'}</span></p>
+                    <p><strong>Porte:</strong><br><span class="copyable" onclick="copyToClipboard(this)">${data.porte || 'N/A'}</span></p>
+                    <p><strong>Capital Social:</strong><br><span class="copyable" onclick="copyToClipboard(this)">${formatarCapital(data.capital_social)}</span></p>
+                </div>
+                <div class="info-card" id="economic-activity-card">
+                    <h3>🏭 Atividade Econômica</h3>
+                    <p><strong>Atividade Principal:</strong></p>
+                    <p>${data.cnae_fiscal_descricao || 'N/A'}</p>
+                    <p><strong>Código CNAE:</strong> ${data.cnae_fiscal || 'N/A'}</p>
+                    <p><strong>Natureza Jurídica:</strong> ${data.natureza_juridica || 'N/A'}</p>
+                    ${atividadesSecundariasHTML}
+                </div>
+                <div class="info-card">
+                    <h3>📍 Endereço</h3>
+                    <p><strong>Logradouro:</strong><br><span class="copyable" onclick="copyToClipboard(this)">${data.logradouro || 'N/A'}</span></p>
+                    <p><strong>Número:</strong><br><span class="copyable" onclick="copyToClipboard(this)">${data.numero || 'S/N'}</span></p>
+                    <p><strong>Bairro:</strong><br><span class="copyable" onclick="copyToClipboard(this)">${data.bairro || 'N/A'}</span></p>
+                    <p><strong>Cidade/UF:</strong><br><span class="copyable" onclick="copyToClipboard(this)">${data.municipio || 'N/A'}</span> / <span class="copyable" onclick="copyToClipboard(this)">${data.uf || 'N/A'}</span></p>
+                    <p><strong>CEP:</strong><br><span class="copyable" onclick="copyToClipboard(this)">${data.cep || 'N/A'}</span></p>
+                </div>
+                <div class="info-card">
+                    <h3>📞 Contato</h3>
+                    ${contatoHTML}
+                </div>
+            </div>
+            <div class="info-grid" id="secondary-grid">
+                <div id="ie-card-container">
+                     <div class="info-card">
+                        <h3>🎯 Inscrições Estaduais</h3>
+                        <div class="mini-spinner"></div>
+                     </div>
+                </div>
+                ${sociosHTML}
+            </div>
+        </div>
+    `;
+}
 
 // =================================================================================
 // ==================== 5. HTML STRING GENERATION HELPERS ==========================
@@ -414,42 +513,48 @@ function updateCardWithIEData(cnpjaData, mainState) {
 // ---------------------------------------------------------------------------------
 
 /**
- * Determines the company's tax regime from either API source.
- * @param {object} data - The data object (e.g., cnpjaData.company or receitaWSData).
+ * Determines the company's tax regime from any of the three API sources.
+ * @param {object} data - The data object from any API.
  * @returns {{text: string, class: string}} An object with the display text and CSS class.
  */
 function getTaxRegimeInfo(data) {
     if (!data) return { text: 'Trib: Outros', class: 'tax-regime-bar' };
 
-    // Check for SIMEI first (using fields from both APIs)
-    if (data.simei?.optante === true || data.simei?.optante === 'SIM') {
+    if (data.simei?.optante === true || data.simei?.optante === 'SIM' || data.opcao_pelo_mei === true) {
         return { text: 'S I M E I', class: 'tax-regime-bar' };
     }
-    // Check for Simples Nacional
-    if (data.simples?.optante === true || data.simples?.optante === 'SIM' || data.simples?.opcao_pelo_simples === 'SIM') {
+    if (data.simples?.optante === true || data.simples?.optante === 'SIM' || data.opcao_pelo_simples === true) {
         return { text: 'Simples', class: 'tax-regime-bar' };
     }
-    // If tax objects exist but are not optant, assume Normal
-    if (data.simples || data.simei) {
+    // MinhaReceita provides tax regime differently
+    if (data.regime_tributario?.length > 0) {
+        const regime = data.regime_tributario[0].forma_de_tributacao;
+        if (regime.includes("SIMPLES")) return { text: 'Simples', class: 'tax-regime-bar' };
+        if (regime.includes("LUCRO")) return { text: 'Trib: Normal', class: 'tax-regime-bar' };
+    }
+    if (data.simples || data.simei || data.opcao_pelo_simples === false) {
         return { text: 'Trib: Normal', class: 'tax-regime-bar' };
     }
-    // Default fallback
     return { text: 'Trib: Outros', class: 'tax-regime-bar' };
 }
 
+
 /**
- * Creates the HTML for the secondary activities section. (This function is compatible with ReceitaWS)
+ * Creates the HTML for secondary activities from any API source.
  * @param {Array<object>} activities - An array of secondary activity objects.
  * @returns {string} The generated HTML string.
  */
 function gerarAtividadesSecundariasHTML(activities) {
-    if (!activities || activities.length === 0) {
-        return ''; // Return empty string if no secondary activities
-    }
+    if (!activities || activities.length === 0) return '';
     const total = activities.length;
     const limit = 2;
-    const createActivityHTML = a => `<p class="activity-item">• ${a.text || 'N/A'} (${a.code || 'N/A'})</p>`;
-    
+
+    const createActivityHTML = a => {
+        const text = a.text || a.descricao || 'N/A'; // Support all sources
+        const code = a.id || a.code || a.codigo || 'N/A';
+        return `<p class="activity-item">• ${text} (${code})</p>`;
+    };
+
     const visibleHtml = activities.slice(0, limit).map(createActivityHTML).join('');
     let hiddenHtml = '', toggleButtonHtml = '';
 
@@ -458,24 +563,31 @@ function gerarAtividadesSecundariasHTML(activities) {
         hiddenHtml = `<div id="hidden-activities" class="hidden">${remaining.map(createActivityHTML).join('')}</div>`;
         toggleButtonHtml = `<p id="toggle-activities-btn" class="toggle-link" data-remaining-count="${remaining.length}" onclick="toggleSecondaryActivities()">Ver mais ${remaining.length}...</p>`;
     }
-    
-    return `
-        <div class="secondary-activities-container">
-            <p style="margin-top: 12px;"><strong>Atividades Secundárias (${total}):</strong></p>
-            ${visibleHtml}${hiddenHtml}${toggleButtonHtml}
-        </div>
-    `;
+
+    return `<div class="secondary-activities-container"><p style="margin-top: 12px;"><strong>Atividades Secundárias (${total}):</strong></p>${visibleHtml}${hiddenHtml}${toggleButtonHtml}</div>`;
 }
 
 /**
- * Creates the HTML for the contact info from either API source.
- * @param {Array|string|null} phones - The phone data.
- * @param {Array|string|null} emails - The email data.
+ * Creates the HTML for contact info from any API source.
+ * @param {object|Array|string|null} primaryData - Phone/email data (or the whole object for MinhaReceita).
+ * @param {Array|string|null} secondaryData - Email data.
  * @returns {string} The generated HTML string.
  */
-function gerarContatoHTML(phones, emails) {
+function gerarContatoHTML(primaryData, secondaryData) {
     let html = '';
-    // Handle phones (CNPJ.A gives an array, ReceitaWS gives a string)
+    let phones = primaryData, emails = secondaryData;
+
+    // Handle MinhaReceita object structure
+    if (typeof primaryData === 'object' && !Array.isArray(primaryData) && primaryData !== null) {
+        const phone1 = primaryData.ddd_telefone_1 ? formatarTelefone(primaryData.ddd_telefone_1) : null;
+        const phone2 = primaryData.ddd_telefone_2 ? formatarTelefone(primaryData.ddd_telefone_2) : null;
+        html += `<p><strong>Telefone:</strong><br><span class="copyable" onclick="copyToClipboard(this)">${phone1 || 'N/A'}</span></p>`;
+        if (phone2) html += `<p><strong>Telefone 2:</strong><br><span class="copyable" onclick="copyToClipboard(this)">${phone2}</span></p>`;
+        html += `<p><strong>Email:</strong><br><span class="copyable" onclick="copyToClipboard(this)">${primaryData.email || 'N/A'}</span></p>`;
+        return html;
+    }
+
+    // Handle CNPJ.A / ReceitaWS structures
     if (Array.isArray(phones) && phones.length > 0) {
         html += phones.slice(0, 2).map((p, i) => `<p><strong>Telefone ${i + 1}:</strong><br><span class="copyable" onclick="copyToClipboard(this)">${formatarTelefone(p.number)}</span></p>`).join('');
     } else if (typeof phones === 'string' && phones) {
@@ -483,16 +595,17 @@ function gerarContatoHTML(phones, emails) {
     } else {
         html += '<p><strong>Telefone:</strong><br><span class="copyable">N/A</span></p>';
     }
-    // Handle emails (CNPJ.A gives an array, ReceitaWS gives a string)
+
     if (Array.isArray(emails) && emails.length > 0) {
         html += emails.slice(0, 2).map((e, i) => `<p><strong>Email ${i + 1}:</strong><br><span class="copyable" onclick="copyToClipboard(this)">${e.address || 'N/A'}</span></p>`).join('');
     } else if (typeof emails === 'string' && emails) {
         html += `<p><strong>Email:</strong><br><span class="copyable" onclick="copyToClipboard(this)">${emails}</span></p>`;
-    } else {
+    } else if (!emails) {
         html += '<p><strong>Email:</strong><br><span class="copyable">N/A</span></p>';
     }
     return html;
 }
+
 
 /**
  * Creates the HTML for the state registrations (Inscrições Estaduais) card.
@@ -523,21 +636,18 @@ function gerarIEHTML(registrations, mainState) {
 }
 
 /**
- * Creates the HTML for the company members from either API source.
- * @param {Array<object>} members - An array of member objects (from CNPJ.A or ReceitaWS).
- * @returns {string} The generated HTML string, or an empty string if none.
+ * Creates the HTML for the company members from any API source.
+ * @param {Array<object>} members - An array of member objects.
+ * @returns {string} The generated HTML string.
  */
 function gerarSociosHTML(members) {
     if (!members || members.length === 0) return '';
-
     let html = `<div class="info-card"><h3>👥 Quadro Societário (${members.length})</h3>`;
     html += members.slice(0, 8).map(m => {
-        // Adapt for both API structures
-        const name = m.person?.name || m.nome || 'N/A';
-        const role = m.role?.text || m.qual || 'Sócio';
+        const name = m.person?.name || m.nome || m.nome_socio || 'N/A';
+        const role = m.role?.text || m.qual || m.qualificacao_socio || 'Sócio';
         return `<p>• ${name}<br><em>${role}</em></p>`;
     }).join('');
-
     if (members.length > 8) {
         html += `<p><em>... e mais ${members.length - 8} membros.</em></p>`;
     }
@@ -545,12 +655,13 @@ function gerarSociosHTML(members) {
     return html;
 }
 
-
 // =================================================================================
 // ================== 6. DATA FORMATTING & VALIDATION UTILITIES ====================
 // =================================================================================
 // Helper functions for cleaning, formatting, and validating data (especially CNPJ).
 // ---------------------------------------------------------------------------------
+/** Delays execution for a specified number of milliseconds. */
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 /** Removes all non-numeric characters from a CNPJ string. */
 function limparCNPJ(cnpj) {
@@ -629,6 +740,19 @@ function validarCNPJ(cnpj) {
 // =================================================================================
 // Functions that manage UI state, animations, and user feedback actions.
 // ---------------------------------------------------------------------------------
+
+/**
+ * Inserts a dismissible warning message at the top of the company card.
+ * @param {string} mensagem - The warning message to display.
+
+function addWarningMessage(mensagem) {
+    const container = document.getElementById('card-warning-message-container');
+    if (container) {
+        // Use a different class for warnings vs. errors
+        container.innerHTML = `<div class="success-message" style="background: #fff3cd; color: #856404; margin-bottom: 15px;">⚠️ ${mensagem}</div>`;
+    }
+}
+**/
 
 /** Hides the top search section and shows the "unfold" button. */
 function foldTopSection() {
