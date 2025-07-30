@@ -195,7 +195,9 @@ function renderCardFromReceitaWS(data, container) {
     };
     const statusInfo = statusMap[situacao.toUpperCase()] || { text: situacao, class: 'status-warning' };
 
-    // Determine tax regime
+    // --- THIS IS THE KEY ---
+    // The tax regime info is determined synchronously from the data we already have.
+    // No new API call is needed here.
     const taxRegimeInfo = getTaxRegimeInfo(data);
 
     // Generate complex HTML sections using helper functions
@@ -205,12 +207,17 @@ function renderCardFromReceitaWS(data, container) {
 
     container.innerHTML = `
         <div class="company-card">
+            <div id="card-warning-message-container"></div>
             <div class="company-header">
                 <div class="company-info-left">
                     <div class="company-name">${data.fantasia || data.nome || 'N/A'}</div>
                     <div class="company-cnpj copyable" onclick="copyToClipboard(this)">${formatarCNPJ(data.cnpj || '')}</div>
                 </div>
                 <div class="status-container">
+                    <!--
+                        THE FIX: The tax regime and status are rendered directly.
+                        There is no placeholder or spinner here.
+                    -->
                     <div class="${taxRegimeInfo.class}">${taxRegimeInfo.text}</div>
                     <div class="status-badge ${statusInfo.class}">${statusInfo.text}</div>
                 </div>
