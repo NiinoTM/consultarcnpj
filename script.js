@@ -33,8 +33,9 @@ document.getElementById('cnpjInput').addEventListener('keypress', e => {
 
 /**
  * The main async function that controls the entire CNPJ lookup process.
- * It attempts to fetch data from ReceitaWS first. If that fails, it
- * automatically falls back to the CNPJ.A API as a secondary source.
+ * It initiates calls to both ReceitaWS and CNPJ.A APIs concurrently.
+ * It will display data from whichever API responds first, and then update
+ * the card if the primary source (ReceitaWS) arrives later.
  */
 async function consultarCNPJ() {
     const cnpjInput = document.getElementById('cnpjInput').value;
@@ -44,6 +45,7 @@ async function consultarCNPJ() {
     const loadingDiv = document.getElementById('loadingDiv');
     const resultsDiv = document.getElementById('resultsDiv');
 
+    // 1. Initial Setup and Validation
     resultsDiv.innerHTML = '';
     if (!cnpjLimpo || !validarCNPJ(cnpjLimpo)) {
         mostrarErro(!cnpjLimpo ? 'Por favor, digite um CNPJ.' : 'CNPJ inválido! Verifique os números digitados.');
@@ -52,47 +54,79 @@ async function consultarCNPJ() {
 
     resultsSection.classList.add('show');
     loadingDiv.style.display = 'block';
+    foldTopSection();
 
-    try {
-        // --- Primary API Attempt (ReceitaWS) ---
-        const receitaWSData = await consultarReceitaWS(cnpjLimpo);
+    // 2. State management for handling the race condition
+    let cnpjaDataCache = null;
+    let receitaWsDataCache = null;
+    let hasRendered = false;
+    let cnpjaFailed = false;
+    let receitaWsFailed = false;
 
-        if (receitaWSData) {
-            // --- SUCCESS PATH: Main source responded ---
-            console.log("Success: Data fetched from primary source (ReceitaWS).");
+    // 3. Define handler functions for API responses
+
+    const handleFailure = (apiName) => {
+        console.error(`${apiName} API failed or returned no data.`);
+        if (apiName === 'CNPJA') cnpjaFailed = true;
+        if (apiName === 'ReceitaWS') receitaWsFailed = true;
+
+        // If both have failed, show the final error message
+        if (cnpjaFailed && receitaWsFailed) {
             loadingDiv.style.display = 'none';
-            renderCardFromReceitaWS(receitaWSData, resultsDiv); // Render using primary data
-            foldTopSection();
-
-            // Fetch supplementary IE data from CNPJ.A in the background
-            consultarCNPJA_API(cnpjLimpo).then(cnpjaData => {
-                updateCardWithIEData(cnpjaData, receitaWSData.uf);
-            });
-
-        } else {
-            // --- FALLBACK PATH: Main source failed, try secondary ---
-            console.warn("Primary source (ReceitaWS) failed. Attempting fallback to CNPJ.A.");
-            const cnpjaData = await consultarCNPJA_API(cnpjLimpo);
-            loadingDiv.style.display = 'none';
-
-            if (cnpjaData) {
-                // --- FALLBACK SUCCESS: Secondary source responded ---
-                console.log("Success: Data fetched from fallback source (CNPJ.A).");
-                renderCardFromCNPJA(cnpjaData, resultsDiv); // Render using fallback data
-                foldTopSection();
-                // Optionally, add a notice that the data is from a secondary source
-                addWarningMessage("Os dados foram obtidos de uma fonte secundária e podem estar incompletos.");
-
-            } else {
-                // --- COMPLETE FAILURE: Both sources failed ---
-                console.error("All data sources failed for CNPJ:", cnpjLimpo);
-                mostrarErro('Não foi possível obter os dados da empresa. Verifique o CNPJ e sua conexão, ou tente novamente mais tarde.');
-            }
+            mostrarErro('Ambas as fontes de dados falharam. Tente novamente mais tarde.');
         }
-    } catch (error) {
-        loadingDiv.style.display = 'none';
-        mostrarErro('Ocorreu um erro inesperado: ' + error.message);
-    }
+    };
+
+    // --- Handler for CNPJ.A (Fallback/Secondary API) ---
+    const handleCnpjaResponse = (data) => {
+        if (!data) {
+            handleFailure('CNPJA');
+            // Ensure the IE placeholder is updated to show "not found" if ReceitaWS succeeds
+            updateCardWithIEData(null, receitaWsDataCache?.uf);
+            return;
+        }
+
+        console.log("CNPJ.A data arrived.");
+        cnpjaDataCache = data;
+
+        // If ReceitaWS has already rendered, just update the IE part
+        if (receitaWsDataCache) {
+            updateCardWithIEData(cnpjaDataCache, receitaWsDataCache.uf);
+        }
+        // Otherwise, if nothing is on screen yet, render this as a fallback
+        else if (!hasRendered) {
+            loadingDiv.style.display = 'none'; // Hide main spinner on first render
+            hasRendered = true;
+            console.log("Rendering fallback data from CNPJ.A.");
+            renderCardFromCNPJA(data, resultsDiv);
+            addWarningMessage("Exibindo dados preliminares. Atualizando com a fonte principal em instantes...");
+        }
+    };
+
+    // --- Handler for ReceitaWS (Primary API) ---
+    const handleReceitaWsResponse = (data) => {
+        if (!data) {
+            handleFailure('ReceitaWS');
+            return;
+        }
+
+        loadingDiv.style.display = 'none'; // Hide main spinner
+        hasRendered = true;
+        console.log("ReceitaWS data arrived. Rendering primary data.");
+        receitaWsDataCache = data;
+
+        // Always re-render with ReceitaWS data as it's the source of truth
+        renderCardFromReceitaWS(data, resultsDiv);
+
+        // If CNPJ.A data has already arrived, use it to fill in the IE details.
+        // If not, the IE card will continue showing its loading spinner until the other call finishes.
+        updateCardWithIEData(cnpjaDataCache, receitaWsDataCache.uf);
+    };
+
+    // 4. Initiate both API calls concurrently without 'await'
+    // This starts the "race". The .then() clause will execute whenever each one finishes.
+    consultarCNPJA_API(cnpjLimpo).then(handleCnpjaResponse);
+    consultarReceitaWS(cnpjLimpo).then(handleReceitaWsResponse);
 }
 
 
