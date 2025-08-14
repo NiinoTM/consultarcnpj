@@ -36,7 +36,8 @@ document.getElementById('cnpjInput').addEventListener('keypress', e => {
  * It initiates calls to THREE APIs concurrently: ReceitaWS (primary),
  * CNPJ.A (secondary), and MinhaReceita (secondary). It displays data from
  * whichever API responds first, and then updates the card if the primary
- * source (ReceitaWS) arrives later.
+ * source (ReceitaWS) arrives later. It also manages a consensus system for
+ * the company's tax regime.
  */
 async function consultarCNPJ() {
     const cnpjInput = document.getElementById('cnpjInput').value;
@@ -65,65 +66,118 @@ async function consultarCNPJ() {
     let failedApiCount = 0;
     const TOTAL_APIS = 3;
 
-    // 3. Define handler functions for API responses
+    // 2.1. NEW: Tax regime consensus tracking state object
+    let taxRegimeConsensus = {
+        sources: [], // Tracks what each API reported (e.g., {api: 'CNPJA', regime: 'Simples'})
+        confirmed: null, // The final determined regime based on priority/consensus
+        needsWarning: false // Flag to show a warning icon for conflicting data
+    };
+
+    // 3. NEW: Helper functions defined within the consultation's scope
+    
+    /**
+     * Updates the tax regime display in the DOM based on the current consensus.
+     */
+    const updateTaxRegimeDisplay = () => {
+        const taxElement = document.querySelector('.tax-regime-bar');
+        if (!taxElement) return;
+
+        const regimeInfo = getTaxRegimeInfo(taxRegimeConsensus);
+        taxElement.textContent = regimeInfo.text;
+    };
+
+/**
+     * THE FIX IS HERE: Updates the consensus state with data from a newly arrived API response.
+     * The logic for 'needsWarning' is now based on majority rule.
+     * @param {string} apiName - The name of the API ('ReceitaWS', 'CNPJA', 'MinhaReceita').
+     * @param {object} data - The data object from the API.
+     */
+    const updateTaxConsensus = (apiName, data) => {
+        const regime = getTaxRegimeFromData(data);
+        taxRegimeConsensus.sources.push({ api: apiName, regime });
+
+        const regimes = taxRegimeConsensus.sources.map(s => s.regime);
+        
+        // Priority logic: SIMEI > Simples > Normal > Outros
+        if (regimes.includes('SIMEI')) {
+            taxRegimeConsensus.confirmed = 'SIMEI';
+        } else if (regimes.includes('Simples')) {
+            taxRegimeConsensus.confirmed = 'Simples';
+        } else if (regimes.includes('Normal')) {
+            taxRegimeConsensus.confirmed = 'Normal';
+        } else {
+            taxRegimeConsensus.confirmed = 'Outros';
+        }
+        
+        // Corrected Warning Logic: A warning is only needed if there is no clear majority.
+        const votesForConfirmed = regimes.filter(r => r === taxRegimeConsensus.confirmed).length;
+        const dissentingVotes = regimes.length - votesForConfirmed;
+        
+        // Show warning if votes for consensus are not strictly greater than dissenters.
+        // This correctly handles 1v1 ties, but resolves 2v1 majorities.
+        taxRegimeConsensus.needsWarning = votesForConfirmed <= dissentingVotes;
+
+        // If a card is already on screen, update its tax display dynamically.
+        if (hasRendered) {
+            updateTaxRegimeDisplay();
+        }
+    };
+    
+    // 4. Define handler functions for API responses
 
     const handleFailure = (apiName) => {
         console.error(`${apiName} API failed or returned no data.`);
         failedApiCount++;
-        // If all APIs have failed, show the final error message
         if (failedApiCount === TOTAL_APIS) {
             loadingDiv.style.display = 'none';
             mostrarErro('Todas as fontes de dados falharam. Tente novamente mais tarde.');
         }
     };
 
-    // --- Handler for CNPJ.A (Secondary) ---
     const handleCnpjaResponse = (data) => {
         if (!data) return handleFailure('CNPJA');
         console.log("CNPJ.A data arrived.");
         cnpjaDataCache = data;
+        updateTaxConsensus('CNPJA', data); // Update consensus
 
-        if (receitaWsDataCache) { // If primary is already rendered, just update IE
+        if (receitaWsDataCache) {
             updateCardWithIEData(cnpjaDataCache, receitaWsDataCache.uf);
-        } else if (!hasRendered) { // Otherwise, if we're first, render ourselves
+        } else if (!hasRendered) {
             loadingDiv.style.display = 'none';
             hasRendered = true;
             console.log("Rendering fallback data from CNPJ.A.");
-            renderCardFromCNPJA(data, resultsDiv);
-            addWarningMessage("Exibindo dados preliminares. Atualizando com a fonte principal...");
+            renderCardFromCNPJA(data, resultsDiv, taxRegimeConsensus); // Pass consensus
         }
     };
 
-    // --- Handler for MinhaReceita (Secondary) ---
     const handleMinhaReceitaResponse = (data) => {
         if (!data) return handleFailure('MinhaReceita');
         console.log("MinhaReceita data arrived.");
         minhaReceitaDataCache = data;
+        updateTaxConsensus('MinhaReceita', data); // Update consensus
 
-        if (!receitaWsDataCache && !hasRendered) { // If we are first, render
+        if (!receitaWsDataCache && !hasRendered) {
             loadingDiv.style.display = 'none';
             hasRendered = true;
             console.log("Rendering fallback data from MinhaReceita.");
-            renderCardFromMinhaReceita(data, resultsDiv);
+            renderCardFromMinhaReceita(data, resultsDiv, taxRegimeConsensus); // Pass consensus
             addWarningMessage("Exibindo dados preliminares. Atualizando com a fonte principal...");
         }
     };
 
-    // --- Handler for ReceitaWS (Primary Source of Truth) ---
     const handleReceitaWsResponse = (data) => {
         if (!data) return handleFailure('ReceitaWS');
         loadingDiv.style.display = 'none';
-        hasRendered = true; // Mark as rendered (or re-rendered)
+        hasRendered = true;
         console.log("ReceitaWS data arrived. Rendering primary data.");
         receitaWsDataCache = data;
+        updateTaxConsensus('ReceitaWS', data); // Update consensus
 
-        // ALWAYS render with ReceitaWS data, as it's the source of truth
-        renderCardFromReceitaWS(data, resultsDiv);
-        // Use cached CNPJ.A data to fill in IE if it has already arrived
+        renderCardFromReceitaWS(data, resultsDiv, taxRegimeConsensus); // Pass consensus
         updateCardWithIEData(cnpjaDataCache, receitaWsDataCache.uf);
     };
 
-    // 4. Initiate ALL THREE API calls concurrently to start the race
+    // 5. Initiate ALL THREE API calls concurrently to start the race
     consultarCNPJA_API(cnpjLimpo).then(handleCnpjaResponse);
     consultarReceitaWS(cnpjLimpo).then(handleReceitaWsResponse);
     consultarMinhaReceitaAPI(cnpjLimpo).then(handleMinhaReceitaResponse);
@@ -244,12 +298,11 @@ async function consultarMinhaReceitaAPI(cnpj) {
 
 /**
  * Renders the main company card using data from the ReceitaWS API.
- * Includes a placeholder for "Inscrição Estadual" data, which will be loaded separately.
  * @param {object} data - The data object from the consultarReceitaWS call.
  * @param {HTMLElement} container - The container element to inject the HTML into.
+ * @param {object} taxRegimeConsensus - The consensus state object.
  */
-function renderCardFromReceitaWS(data, container) {
-    // Map status text to user-friendly text and CSS classes
+function renderCardFromReceitaWS(data, container, taxRegimeConsensus) {
     const situacao = data.situacao || 'DESCONHECIDO';
     const statusMap = {
         'ATIVA': { text: 'Ativa', class: 'status-active' },
@@ -259,13 +312,7 @@ function renderCardFromReceitaWS(data, container) {
         'NULA': { text: 'Nula', class: 'status-warning' }
     };
     const statusInfo = statusMap[situacao.toUpperCase()] || { text: situacao, class: 'status-warning' };
-
-    // --- THIS IS THE KEY ---
-    // The tax regime info is determined synchronously from the data we already have.
-    // No new API call is needed here.
-    const taxRegimeInfo = getTaxRegimeInfo(data);
-
-    // Generate complex HTML sections using helper functions
+    const taxRegimeInfo = getTaxRegimeInfo(taxRegimeConsensus);
     const contatoHTML = gerarContatoHTML(data.telefone, data.email);
     const sociosHTML = gerarSociosHTML(data.qsa);
     const atividadesSecundariasHTML = gerarAtividadesSecundariasHTML(data.atividades_secundarias);
@@ -279,10 +326,6 @@ function renderCardFromReceitaWS(data, container) {
                     <div class="company-cnpj copyable" onclick="copyToClipboard(this)">${formatarCNPJ(data.cnpj || '')}</div>
                 </div>
                 <div class="status-container">
-                    <!--
-                        THE FIX: The tax regime and status are rendered directly.
-                        There is no placeholder or spinner here.
-                    -->
                     <div class="${taxRegimeInfo.class}">${taxRegimeInfo.text}</div>
                     <div class="status-badge ${statusInfo.class}">${statusInfo.text}</div>
                 </div>
@@ -319,7 +362,6 @@ function renderCardFromReceitaWS(data, container) {
                 </div>
             </div>
             <div class="info-grid" id="secondary-grid">
-                <!-- Placeholder for IE, which comes from the secondary API -->
                 <div id="ie-card-container">
                      <div class="info-card">
                         <h3>🎯 Inscrições Estaduais</h3>
@@ -335,15 +377,13 @@ function renderCardFromReceitaWS(data, container) {
 
 /**
  * Renders the company card using data from the fallback API (CNPJ.A).
- * This is triggered when the primary ReceitaWS API fails.
  * @param {object} data - The data object from the consultarCNPJA_API call.
  * @param {HTMLElement} container - The container element to inject the HTML into.
+ * @param {object} taxRegimeConsensus - The consensus state object.
  */
-function renderCardFromCNPJA(data, container) {
+function renderCardFromCNPJA(data, container, taxRegimeConsensus) {
     const company = data.company || {};
     const address = data.address || {};
-
-    // Map status from CNPJ.A data
     const statusMap = {
         1: { text: 'Ativa', class: 'status-active' },
         2: { text: 'Ativa', class: 'status-active' },
@@ -352,11 +392,7 @@ function renderCardFromCNPJA(data, container) {
         8: { text: 'Baixada', class: 'status-inactive' }
     };
     const statusInfo = statusMap[data.status?.id] || { text: 'Desconhecido', class: 'status-warning' };
-
-    // Determine tax regime from CNPJ.A data
-    const taxRegimeInfo = getTaxRegimeInfo(data);
-
-    // Generate HTML for dynamic sections using universal helpers
+    const taxRegimeInfo = getTaxRegimeInfo(taxRegimeConsensus);
     const contatoHTML = gerarContatoHTML(data.phones, data.emails);
     const ieHTML = gerarIEHTML(data.registrations, address.state);
     const sociosHTML = gerarSociosHTML(data.company?.members);
@@ -421,13 +457,10 @@ function updateCardWithIEData(cnpjaData, mainState) {
     const ieContainer = document.getElementById('ie-card-container');
     if (!ieContainer) return;
 
-    // Check if there is data and registrations exist
     if (cnpjaData && cnpjaData.registrations && cnpjaData.registrations.length > 0) {
-        // Use the existing helper to generate the HTML for the IE card
         const ieHTML = gerarIEHTML(cnpjaData.registrations, mainState);
         ieContainer.innerHTML = ieHTML;
     } else {
-        // If no data or no registrations, show a message.
         ieContainer.innerHTML = `
             <div class="info-card">
                 <h3>🎯 Inscrições Estaduais</h3>
@@ -439,15 +472,15 @@ function updateCardWithIEData(cnpjaData, mainState) {
 
 /**
  * Renders the company card using data from the MinhaReceita API.
- * This is used as a fast secondary source.
  * @param {object} data - The data object from the consultarMinhaReceitaAPI call.
  * @param {HTMLElement} container - The container element to inject the HTML into.
+ * @param {object} taxRegimeConsensus - The consensus state object.
  */
-function renderCardFromMinhaReceita(data, container) {
+function renderCardFromMinhaReceita(data, container, taxRegimeConsensus) {
     const statusMap = { 'ATIVA': { text: 'Ativa', class: 'status-active' } };
     const statusInfo = statusMap[data.descricao_situacao_cadastral] || { text: data.descricao_situacao_cadastral, class: 'status-warning' };
-    const taxRegimeInfo = getTaxRegimeInfo(data);
-    const contatoHTML = gerarContatoHTML(data, null); // Pass the whole object
+    const taxRegimeInfo = getTaxRegimeInfo(taxRegimeConsensus);
+    const contatoHTML = gerarContatoHTML(data, null);
     const sociosHTML = gerarSociosHTML(data.qsa);
     const atividadesSecundariasHTML = gerarAtividadesSecundariasHTML(data.cnaes_secundarios);
 
@@ -513,53 +546,65 @@ function renderCardFromMinhaReceita(data, container) {
 // ---------------------------------------------------------------------------------
 
 /**
- * Determines the company's tax regime from a full API response object.
- * This final version correctly inspects the nested "optante" property for all API structures,
- * including ReceitaWS.
+ * NEW: Extracts a standardized tax regime string from any of the three API responses.
  * @param {object} data - The full data object from any of the three APIs.
- * @returns {{text: string, class: string}} An object with the display text and CSS class.
+ * @returns {string} The tax regime: 'SIMEI', 'Simples', 'Normal', or 'Outros'.
  */
-function getTaxRegimeInfo(data) {
-    if (!data) {
-        return { text: 'Trib: Outros', class: 'tax-regime-bar' };
+function getTaxRegimeFromData(data) {
+    if (!data) return 'Outros';
+
+    // 1. Check for SIMEI (MEI) - Highest Priority
+    if (
+        data.opcao_pelo_mei === true ||          // MinhaReceita
+        data.simei?.optante === true ||          // ReceitaWS
+        data.company?.simei?.optant === true     // CNPJ.A
+    ) {
+        return 'SIMEI';
     }
 
-    // Use optional chaining (?.) to safely check nested properties without errors.
-
-    // --- 1. Check for SIMEI ---
+    // 2. Check for Simples Nacional
     if (
-        (data.company?.simei?.optant === true) ||  // Handles CNPJ.A structure
-        (data.opcao_pelo_mei === true) ||          // Handles MinhaReceita structure
-        (data.simei?.optante === true)             // Handles ReceitaWS structure <-- THE CRITICAL FIX
+        data.opcao_pelo_simples === true ||      // MinhaReceita
+        data.simples?.optante === true ||        // ReceitaWS
+        data.company?.simples?.optant === true   // CNPJ.A
     ) {
-        return { text: 'S I M E I', class: 'tax-regime-bar' };
-    }
-
-    // --- 2. Check for Simples Nacional ---
-    if (
-        (data.company?.simples?.optant === true) || // Handles CNPJ.A structure
-        (data.opcao_pelo_simples === true) ||       // Handles MinhaReceita structure
-        (data.simples?.optant === true)             // Handles ReceitaWS structure <-- THE CRITICAL FIX
-    ) {
-        return { text: 'Simples', class: 'tax-regime-bar' };
+        return 'Simples';
     }
     
-    // --- 3. Check for an explicit "Normal Regime" status ---
+    // 3. Check for an explicit "Normal Regime" status
     if (
-        (data.company?.simples?.optant === false) ||
-        (data.opcao_pelo_simples === false) ||
-        (data.simples?.optant === false)
+        data.opcao_pelo_simples === false ||     // MinhaReceita
+        data.simples?.optant === false ||        // ReceitaWS
+        data.company?.simples?.optant === false
     ) {
-        return { text: 'Trib: Normal', class: 'tax-regime-bar' };
+        return 'Normal';
     }
 
-    // --- 4. Fallback if no specific data is found ---
-    return { text: 'Trib: Outros', class: 'tax-regime-bar' };
+    // 4. Fallback if no specific data is found
+    return 'Outros';
 }
 
+/**
+ * NEW: Determines the display text and class for the tax regime based on the consensus.
+ * @param {object} consensus - The taxRegimeConsensus state object.
+ * @returns {{text: string, class: string}} An object with the display text and CSS class.
+ */
+function getTaxRegimeInfo(consensus) {
+    const regimeMap = {
+        'SIMEI': 'S I M E I',
+        'Simples': 'Simples',
+        'Normal': 'Trib: Normal',
+        'Outros': 'Trib: Outros'
+    };
 
+    const text = regimeMap[consensus.confirmed] || 'Trib: Outros';
+    const warningIcon = consensus.needsWarning ? ' ⚠️' : '';
 
-
+    return {
+        text: text + warningIcon,
+        class: 'tax-regime-bar'
+    };
+}
 
 /**
  * Creates the HTML for secondary activities from any API source.
@@ -631,7 +676,6 @@ function gerarContatoHTML(primaryData, secondaryData) {
 
 /**
  * Creates the HTML for the state registrations (Inscrições Estaduais) card.
- * (Unchanged, as it relies on the CNPJ.A data structure)
  * @param {Array<object>} registrations - An array of registration objects.
  * @param {string} mainState - The primary state of the company's address to highlight.
  * @returns {string} The generated HTML string, or an empty string if it shouldn't be rendered.
@@ -643,7 +687,6 @@ function gerarIEHTML(registrations, mainState) {
     registrations.forEach(reg => {
         const classes = ['ie-item'];
         if (!reg.enabled) classes.push('inactive');
-        // Highlight the registration that matches the main company address state
         if (mainState && reg.state?.toUpperCase() === mainState.toUpperCase()) {
             classes.push(reg.enabled ? 'highlighted-active' : 'highlighted-inactive');
         }
@@ -682,53 +725,38 @@ function gerarSociosHTML(members) {
 // =================================================================================
 // Helper functions for cleaning, formatting, and validating data (especially CNPJ).
 // ---------------------------------------------------------------------------------
-/** Delays execution for a specified number of milliseconds. */
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-/** Removes all non-numeric characters from a CNPJ string. */
 function limparCNPJ(cnpj) {
     return cnpj.replace(/[^0-9]/g, '');
 }
 
-/** Formats a clean CNPJ string into the standard ##.###.###/####-## format. */
 function formatarCNPJ(cnpj) {
     const cnpjLimpo = limparCNPJ(cnpj);
     return cnpjLimpo.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, "$1.$2.$3/$4-$5");
 }
 
-/** Formats a phone number string into a standard (##) #####-#### format. */
 function formatarTelefone(telefone) {
     if (!telefone) return 'N/A';
     const num = telefone.replace(/\D/g, '');
     if (num.length === 11) return `(${num.substring(0,2)}) ${num.substring(2,7)}-${num.substring(7)}`;
     if (num.length === 10) return `(${num.substring(0,2)}) ${num.substring(2,6)}-${num.substring(6)}`;
-    return telefone; // Return original if format is not recognized
+    return telefone;
 }
 
-/** Formats a date string into the Brazilian pt-BR locale format (DD/MM/YYYY). */
 function formatarData(data) {
     if (!data) return null;
     return new Date(data).toLocaleDateString('pt-BR', { timeZone: 'UTC' });
 }
 
-/** Formats a number into a Brazilian Real (R$) currency string. */
 function formatarCapital(capital) {
     if (capital === null || capital === undefined) return 'N/A';
     return `R$ ${parseFloat(capital).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
-/**
- * Validates a CNPJ number using the official Brazilian algorithm.
- * @param {string} cnpj - The CNPJ to validate (can be formatted or clean).
- * @returns {boolean} True if the CNPJ is valid, false otherwise.
- */
 function validarCNPJ(cnpj) {
     const cnpjLimpo = limparCNPJ(cnpj);
-
-    // Basic checks: length and all-same-digit sequence (e.g., 11.111.111/1111-11)
     if (cnpjLimpo.length !== 14 || /^(\d)\1+$/.test(cnpjLimpo)) return false;
-
-    // --- Verification Digit 1 ---
     let tamanho = cnpjLimpo.length - 2;
     let numeros = cnpjLimpo.substring(0, tamanho);
     let digitos = cnpjLimpo.substring(tamanho);
@@ -740,8 +768,6 @@ function validarCNPJ(cnpj) {
     }
     let resultado = soma % 11 < 2 ? 0 : 11 - (soma % 11);
     if (resultado !== parseInt(digitos.charAt(0), 10)) return false;
-
-    // --- Verification Digit 2 ---
     tamanho += 1;
     numeros = cnpjLimpo.substring(0, tamanho);
     soma = 0;
@@ -751,14 +777,11 @@ function validarCNPJ(cnpj) {
         if (pos < 2) pos = 9;
     }
     resultado = soma % 11 < 2 ? 0 : 11 - (soma % 11);
-
-    // Final check
     return resultado === parseInt(digitos.charAt(1), 10);
 }
 
-/** Removes all non-numeric characters from a CEP string for display. */
 function limparCEP(cep) {
-    if (!cep) return 'N/A'; // Return 'N/A' if the input is null or empty
+    if (!cep) return 'N/A';
     return cep.replace(/[^0-9]/g, '');
 }
 
@@ -771,63 +794,46 @@ function limparCEP(cep) {
 /**
  * Inserts a dismissible warning message at the top of the company card.
  * @param {string} mensagem - The warning message to display.
-
+*/
 function addWarningMessage(mensagem) {
     const container = document.getElementById('card-warning-message-container');
     if (container) {
-        // Use a different class for warnings vs. errors
         container.innerHTML = `<div class="success-message" style="background: #fff3cd; color: #856404; margin-bottom: 15px;">⚠️ ${mensagem}</div>`;
     }
 }
-**/
 
-/** Hides the top search section and shows the "unfold" button. */
 function foldTopSection() {
     document.getElementById('topSectionWrapper').classList.add('folded');
     document.getElementById('unfoldButtonContainer').style.display = 'block';
 }
 
-/** Toggles the visibility of the top search section. */
 function toggleTopSection() {
     document.getElementById('topSectionWrapper').classList.toggle('folded');
 }
 
-/** Toggles the visibility of hidden secondary activities and updates the button text. */
 function toggleSecondaryActivities() {
     const hiddenActivities = document.getElementById('hidden-activities');
     const toggleBtn = document.getElementById('toggle-activities-btn');
     if (!hiddenActivities || !toggleBtn) return;
-
     hiddenActivities.classList.toggle('hidden');
     const isHidden = hiddenActivities.classList.contains('hidden');
-    // Update button text based on visibility
     toggleBtn.innerHTML = isHidden ? `Ver mais ${toggleBtn.dataset.remainingCount}...` : 'Ver menos';
 }
 
-/**
- * Copies the text content of a given HTML element to the clipboard and provides
- * visual feedback to the user.
- * @param {HTMLElement} element - The element whose innerText will be copied.
- */
 function copyToClipboard(element) {
     const textToCopy = element.innerText?.toUpperCase();
-    if (!textToCopy || textToCopy === 'N/A') return; // Don't copy empty or N/A values
-
+    if (!textToCopy || textToCopy === 'N/A') return;
     navigator.clipboard.writeText(textToCopy).then(() => {
         const originalHTML = element.innerHTML;
-        element.innerHTML = '✅ Copiado!'; // Provide success feedback
-        setTimeout(() => { element.innerHTML = originalHTML; }, 1200); // Revert after a delay
+        element.innerHTML = '✅ Copiado!';
+        setTimeout(() => { element.innerHTML = originalHTML; }, 1200);
     }).catch(err => console.error('Falha ao copiar:', err));
 }
 
-/**
- * Displays an error message in the results area.
- * @param {string} mensagem - The error message to display.
- */
 function mostrarErro(mensagem) {
     const resultsSection = document.getElementById('resultsSection');
     const resultsDiv = document.getElementById('resultsDiv');
     resultsDiv.innerHTML = `<div class="error-message">❌ ${mensagem}</div>`;
-    resultsSection.classList.add('show'); // Ensure the results section is visible
-    foldTopSection(); // Hide the search bar to show the error clearly
+    resultsSection.classList.add('show');
+    foldTopSection();
 }
